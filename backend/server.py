@@ -1,0 +1,1 @@
+from fastapi import FastAPI\nfrom fastapi import status\nimport uvicorn\n\napp = FastAPI()\n\n@app.get("/healthz")\ndef health():\n    return {\"status\": "ok"}\n\nif __name__ == "__main__":\n    uvicorn.run(app, host="0.0.0.0", port=8000)
