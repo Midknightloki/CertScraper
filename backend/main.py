@@ -1,51 +1,50 @@
-import os
-import asyncio
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel
-from typing import List
-from pathlib import Path
-from playwright.async_api import async_playwright
+from fastapi import FastAPI, BackgroundTasks
 
+# Initialize FastAPI app
 app = FastAPI()
 
-CERT_LIST = [
-    {"id": "az-900", "name": "Microsoft Azure Fundamentals"},
-    {"id": "ai-102", "name": "Designing and Implementing an Azure AI Solution"},
-    {"id": "dp-100", "name": "Microsoft Power Platform Data Analyst"},
-    # Add more certifications as needed
+# Cloudflare Stream configuration for edge PDF caching (optional)
+# from fastapi.middleware.trustedhost import TrustedHostMiddleware
+# app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*.certscraper.holocronlabs.net"])!
+
+# Configure Microsoft Learn API access
+# Example environment variables to add:
+# MICROSOFT_LEARN_API_KEY="your-api-key-here"
+# MICROSOFT_LEARN_BASE_URL="https://learn.microsoft.com/"!
+
+# Temporary storage directory for certifications (specify path)
+OUTPUT_DIR = "./pdfs"
+
+# List of official Microsoft certification categories (update dynamically)
+CATEGORIES = [
+    "az-104": {"name": "Microsoft Azure Fundamentals"},
+    "pl-900": {"name": "Microsoft Power Platform Fundamentals"},
+    "ai-900": {"name": "Microsoft Azure AI Fundamentals"},
+    "sc-900": {"name": "Microsoft Security, Compliance, and Identity Fundamentals"},
+    "m365sc-101": {"name": "Microsoft 365 Messaging"},
+    "m365si-101": {"name": "Microsoft 365 Identity and Access Administrator"},
+    "m365se-101": {"name": "Microsoft 365 Security Administrator"},
+    "m365se-102": {"name": "Microsoft 365 Security Operator"}
 ]
 
-class CertRequest(BaseModel):
-    cert_id: str
+# Study material categories to extract
+STUDY_MATERIALS = [
+    "learn-pathway-links",
+    "skill-pathway-links",
+    "virtual-trainings",
+    "video-course-ids",
+    "document-links",
+    "assessment-practice-links"
+]
 
-@app.get("/certs", response_model=List[dict])
-async def get_certs():
-    return CERT_LIST
+# Cloudflare tunnel configuration (example)
+# docker-compose.yml cloudflared section:
+# cloudflared:
+#   host: 0.tcp.ngrok.io
+#   proxy: tcp://localhost:80!
 
-@app.post("/scrape")
-async def scrape_cert(request: CertRequest, background_tasks: BackgroundTasks):
-    cert = next((c for c in CERT_LIST if c["id"] == request.cert_id), None)
-    if not cert:
-        raise HTTPException(status_code=404, detail="Certification not found")
-    output_dir = Path("./output")
-    output_dir.mkdir(exist_ok=True)
-    output_path = output_dir / f"{cert['id']}.pdf"
-    # Run scraping in background to avoid blocking request
-    background_tasks.add_task(run_scrape, cert['id'], str(output_path))
-    return {"message": "Scraping started", "output_path": str(output_path)}
-
-async def run_scrape(cert_id: str, output_path: str):
-    url = f"https://learn.microsoft.com/en-us/certifications/{cert_id}"
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            page = await browser.new_page()
-            await page.goto(url, timeout=60000)
-            # Wait for main content to load
-            await page.wait_for_selector("main", timeout=60000)
-            # Save as PDF
-            await page.pdf(path=output_path, format="A4")
-            await browser.close()
-    except Exception as e:
-        # Log error (in real app use proper logging)
-        print(f"Error scraping {cert_id}: {e}")
+# Run FastAPI app with Uvicorn
+# Command: uvicorn ‘main’*:
+#   --reload
+#   --host 0.0.0.0
+#   --port 8000
