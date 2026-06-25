@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
@@ -7,7 +7,7 @@ import re
 import asyncio
 import logging
 from typing import List, Set
-from playwright.async_api import async_playwright
+from urllib.parse import urlparse, urljoin
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -44,75 +44,13 @@ def sanitize_filename(text: str) -> str:
 
 def normalize_url(href: str) -> str:
     """Convert relative URLs to absolute URLs."""
-    if href.startswith("/"):
-        return "https://learn.microsoft.com" + href
-    return href
-
-async def scrape_certification_page(url: str, save_dir: Path, browser, visited_urls: Set[str]) -> List[Path]:
-    """Scrape a Microsoft Learn page and all linked study material pages."""
-    pdf_paths = []
-    
-    page = await browser.new_page()
-    
-    try:
-        # Navigate to the page and extract all links
-        await page.goto(url, wait_until="networkidle")
-        await asyncio.sleep(2)  # Give time for content to load
-        
-        # Get all links on the page
-        links = await page.query_selector_all("a[href]")
-        
-        # Process each link that looks like study material
-        for link in links:
-            href = await link.get_attribute("href")
-            
-            # Check if this is a valid Microsoft Learn URL (includes relative paths)
-            if not href:
-                continue
-            
-            # Normalize URL to handle relative paths
-            full_url = normalize_url(href)
-            
-            # Skip URLs that aren't from Microsoft Learn
-            if "learn.microsoft.com" not in full_url:
-                continue
-            
-            # Skip already visited URLs to avoid loops and duplicates
-            if full_url in visited_urls:
-                continue
-            
-            visited_urls.add(full_url)
-            
-            # Generate PDF for this URL
-            try:
-                filename = sanitize_filename(full_url) + ".pdf"
-                pdf_path = save_dir / filename
-                
-                # Reuse existing browser instance - just create a new page
-                pdf_page = await browser.new_page()
-                await pdf_page.goto(full_url, wait_until="networkidle")
-                await pdf_page.pdf(path=str(pdf_path), timeout=60000)
-                await pdf_page.close()
-                
-                pdf_paths.append(pdf_path)
-                logger.info(f"Generated PDF: {pdf_path}")
-                
-            except Exception as e:
-                logger.error(f"Failed to generate PDF for {full_url}: {e}")
-                continue
-                
-    except Exception as e:
-        logger.error(f"Failed to scrape page {url}: {e}")
-    finally:
-        await page.close()
-    
-    return pdf_paths
+    return urljoin("https://learn.microsoft.com", href)
 
 async def scrape_certification(cert_id: str) -> List[Path]:
-    """Scrape Microsoft Learn pages for a certification and generate PDFs."""
+    """Scrape Microsoft Learn pages for a certification and generate PDFs recursively."""
     global scraping_status
     
-    pdf_paths = []
+    pdf_paths: List[Path] = []
     cert_folder = OUTPUT_DIR / cert_id
     cert_folder.mkdir(parents=True, exist_ok=True)
     
@@ -125,18 +63,62 @@ async def scrape_certification(cert_id: str) -> List[Path]:
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
+            # Create a persistent browser context and page for link extraction
+            context = await browser.new_context()
+            page = await context.new_page()
             
-            # Track visited URLs to prevent loops
+            # BFS queue for recursive link discovery
+            queue: List[str] = [start_url]
             visited_urls: Set[str] = set()
             
-            # Scrape main page
-            main_pdfs = await scrape_certification_page(start_url, cert_folder, browser, visited_urls)
-            pdf_paths.extend(main_pdfs)
+            while queue:
+                url = queue.pop(0)
+                if url in visited_urls:
+                    continue
+                visited_urls.add(url)
+                
+                # Navigate to the page to extract links
+                await page.goto(url, wait_until="networkidle")
+                await asyncio.sleep(1)  # Allow content to render
+                
+                # Extract all links on the page
+                anchors = await page.query_selector_all("a[href]")
+                for anchor in anchors:
+                    href = await anchor.get_attribute("href")
+                    if not href:
+                        continue
+                    # Normalize and validate URL
+                    full_url = normalize_url(href)
+                    parsed = urlparse(full_url)
+                    if parsed.netloc != "learn.microsoft.com":
+                        continue
+                    # Skip already visited URLs
+                    if full_url not in visited_urls:
+                        queue.append(full_url)
+                
+                # Generate PDF for the current URL
+                try:
+                    filename = sanitize_filename(url) + ".pdf"
+                    pdf_path = cert_folder / filename
+                    
+                    # Create a dedicated page for PDF generation
+                    pdf_page = await browser.new_page()
+                    try:
+                        await pdf_page.goto(url, wait_until="networkidle")
+                        await pdf_page.pdf(path=str(pdf_path), timeout=60000)
+                        pdf_paths.append(pdf_path)
+                        logger.info(f"Generated PDF: {pdf_path}")
+                    finally:
+                        await pdf_page.close()
+                except Exception as e:
+                    logger.error(f"Failed to generate PDF for {url}: {e}")
+                    continue
             
             await browser.close()
         
+        # Mark as completed
         scraping_status[cert_id] = {"status": "completed", "pdfs": [p.name for p in pdf_paths]}
-        
+    
     except Exception as e:
         logger.error(f"Scraping failed for {cert_id}: {e}")
         scraping_status[cert_id] = {"status": "failed", "error": str(e)}
@@ -145,7 +127,7 @@ async def scrape_certification(cert_id: str) -> List[Path]:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    """List all PDF files generated so far."""
+    """Render the main page listing generated PDFs."""
     pdf_files = []
     for cert_id in CERTIFICATIONS:
         cert_folder = OUTPUT_DIR / cert_id
@@ -166,9 +148,14 @@ async def index(request: Request):
 async def initiate_scrape(cert_id: str, background_tasks: BackgroundTasks):
     """Initiate scraping for a certification (non-blocking)."""
     if cert_id not in CERTIFICATIONS:
-        return {"error": "Invalid certification ID"}
+        return JSONResponse({"error": "Invalid certification ID"}, status_code=400)
     
-    # Run scraping in background
+    # Prevent duplicate queuing
+    current_status = scraping_status.get(cert_id, {}).get("status")
+    if current_status in ["queued", "in_progress"]:
+        return JSONResponse({"error": "Scraping already queued or in progress"}, status_code=409)
+    
+    # Queue the scraping task
     scraping_status[cert_id] = {"status": "queued"}
     background_tasks.add_task(scrape_certification, cert_id)
     
@@ -178,17 +165,19 @@ async def initiate_scrape(cert_id: str, background_tasks: BackgroundTasks):
 async def get_scrape_status(cert_id: str):
     """Get the current scraping status for a certification."""
     if cert_id not in CERTIFICATIONS:
-        return {"error": "Invalid certification ID"}
+        return JSONResponse({"error": "Invalid certification ID"}, status_code=400)
     
-    status = scraping_status.get(cert_id, {"status": "not_started"})
-    return status
+    return scraping_status.get(cert_id, {"status": "not_started"})
 
 @app.get("/pdfs/{filename}", response_class=FileResponse)
 async def download_pdf(filename: str):
-    """Search in certification subfolders and return the PDF file."""
-    for cert_id in CERTIFICATIONS:
-        cert_folder = OUTPUT_DIR / cert_id
-        pdf_path = cert_folder / filename
-        if pdf_path.exists():
-            return FileResponse(pdf_path)
-    return {"error": "File not found"}
+    """Serve a PDF file from the output directory with path traversal protection."""
+    # Resolve the requested file path safely
+    candidate = (OUTPUT_DIR / filename).resolve()
+    # Ensure the resolved path is within OUTPUT_DIR
+    if not str(candidate).startswith(str(OUTPUT_DIR.resolve())):
+        return JSONResponse({"error": "Invalid file path"}, status_code=400)
+    pdf_path = candidate
+    if not pdf_path.is_file():
+        return JSONResponse({"error": "File not found"}, status_code=404)
+    return FileResponse(pdf_path)
