@@ -1,23 +1,19 @@
-version: '3.8'
+version: "3.8"
 
 services:
   app:
     build: .
-    container_name: certscraper_app
-    restart: unless-stopped
     ports:
       - "8000:8000"
     volumes:
       - ./pdfs:/app/pdfs
-    environment:
-      - BASE_URL=https://learn.microsoft.com
+    restart: unless-stopped
 
   cloudflared:
     image: cloudflare/cloudflared:latest
-    container_name: certscraper_tunnel
-    restart: unless-stopped
-    command: tunnel --config /etc/cloudflared/config.yml run
-    volumes:
-      - ./cloudflared/config.yml:/etc/cloudflared/config.yml:ro
+    command: cloudflared tunnel --no-autoupdate --token ${CF_TUNNEL_TOKEN} certscraper.holocronlabs.net
+    environment:
+      - CF_TUNNEL_TOKEN=${CF_TUNNEL_TOKEN}
     depends_on:
       - app
+    restart: unless-stopped

@@ -1,4 +1,5 @@
-tunnel: certscraper
+tunnel: certscraper-tunnel
+credentials-file: /etc/cloudflared/cert.pem
 ingress:
   - hostname: certscraper.holocronlabs.net
     service: http://app:8000
