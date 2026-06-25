@@ -5,6 +5,7 @@ from fastapi.templating import Jinja2Templates
 from pathlib import Path
 import re
 import asyncio
+from typing import List
 
 app = FastAPI()
 
@@ -32,6 +33,60 @@ def sanitize_filename(text: str) -> str:
     # Replace any non-alphanumeric character with underscore
     return re.sub(r'[^a-zA-Z0-9]+', '_', text).strip('_')
 
+async def scrape_certification_page(url: str, save_dir: Path) -> List[Path]:
+    """Scrape a Microsoft Learn page and all linked study material pages."""
+    from playwright.async_api import async_playwright
+    
+    pdf_paths = []
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        
+        # Navigate to the page and extract all links
+        await page.goto(url, wait_until="networkidle")
+        await asyncio.sleep(2)  # Give time for content to load
+        
+        # Get all links on the page
+        links = await page.query_selector_all("a[href]")
+        
+        # Process each link that looks like study material
+        for link in links:
+            href = await link.get_attribute("href")
+            if not href or "learn.microsoft.com" not in href:
+                continue
+                
+            # Normalize URL
+            if href.startswith("/"):
+                full_url = "https://learn.microsoft.com" + href
+            else:
+                full_url = href
+                
+            # Skip already visited URLs to avoid loops
+            visited_urls = await page.evaluate("() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href)")
+            
+            # Generate PDF for this URL
+            try:
+                filename = sanitize_filename(full_url) + ".pdf"
+                pdf_path = save_dir / filename
+                
+                # Create new page for PDF generation to avoid interference
+                async with async_playwright() as p2:
+                    pdf_browser = await p2.chromium.launch(headless=True)
+                    pdf_page = await pdf_browser.new_page()
+                    await pdf_page.goto(full_url, wait_until="networkidle")
+                    await pdf_page.pdf(path=str(pdf_path), timeout=60000)
+                    await pdf_browser.close()
+                
+                pdf_paths.append(pdf_path)
+                
+            except Exception as e:
+                continue
+        
+        await browser.close()
+    
+    return pdf_paths
+
 async def scrape_certification(cert_id: str) -> list[Path]:
     """Scrape Microsoft Learn pages for a certification and generate PDFs."""
     pdf_paths = []
@@ -41,48 +96,13 @@ async def scrape_certification(cert_id: str) -> list[Path]:
     # Start with the certification page
     start_url = f"https://learn.microsoft.com/en-us/certifications/{cert_id}"
     
-    async def _scrape_page(url: str):
-        from playwright.async_api import async_playwright
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(url, wait_until="networkidle")
-            
-            # Extract links that look like study material
-            links = page.query_selector_all("a[href]")
-            study_urls = set()
-            for link in links:
-                href = link.get_attribute("href")
-                if href and "learn.microsoft.com" in href:
-                    # Normalize URL
-                    if href.startswith("/"):
-                        full_url = "https://learn.microsoft.com" + href
-                    else:
-                        full_url = href
-                    if any(keyword in href.lower() for keyword in ["training", "documentation", "learning-path"]):
-                        study_urls.add(full_url)
-            
-            # Generate PDF for each study URL
-            for url in study_urls:
-                # Derive a filename based on URL path
-                filename = sanitize_filename(url) + ".pdf"
-                pdf_path = cert_folder / filename
-                # Use Playwright to PDF the page
-                async with async_playwright() as p:
-                    browser = await p.chromium.launch(headless=True)
-                    page = await browser.new_page()
-                    await page.goto(url, wait_until="networkidle")
-                    await page.pdf(path=pdf_path, timeout=60000)
-                    await browser.close()
-                pdf_paths.append(pdf_path)
+    # Scrape main page
+    main_pdfs = await scrape_certification_page(start_url, cert_folder)
+    pdf_paths.extend(main_pdfs)
     
-    # Schedule all page scrapes concurrently
-    await _scrape_page(start_url)
+    # Recursively follow pagination or additional pages by looking for next page links
+    # For now, we'll just process the direct links found on the certification page
     
-    # Optionally, recursively follow pagination or additional links
-    # For now, just process the direct links found on the certification page
-    
-    await browser.close()
     return pdf_paths
 
 @app.get("/", response_class=HTMLResponse)
