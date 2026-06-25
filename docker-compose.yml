@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: certscraper_app
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./pdfs:/app/pdfs
+    environment:
+      - BASE_URL=https://learn.microsoft.com
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: certscraper_tunnel
+    restart: unless-stopped
+    command: tunnel --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./cloudflared/config.yml:/etc/cloudflared/config.yml:ro
+    depends_on:
+      - app

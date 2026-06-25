@@ -1,0 +1,5 @@
+tunnel: certscraper
+ingress:
+  - hostname: certscraper.holocronlabs.net
+    service: http://app:8000
+  - service: http_status:404
