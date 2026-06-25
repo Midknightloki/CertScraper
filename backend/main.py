@@ -11,6 +11,7 @@ from urllib.parse import urlparse, urljoin, urldefrag
 from playwright.async_api import async_playwright
 from collections import deque
 import hashlib
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -22,7 +23,7 @@ app = FastAPI()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Serve static files (relative paths)
-ap.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 # Templates directory (relative to project root)
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -43,8 +44,27 @@ CERTIFICATIONS = {
 OUTPUT_DIR = BASE_DIR / "pdfs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# In-memory scraping status
-scraping_status: dict = {}
+# Status file to persist scraping state across restarts
+STATUS_FILE = BASE_DIR / "scraping_status.json"
+
+# Load scraping status from file if exists, otherwise initialize empty dict
+if STATUS_FILE.exists():
+    try:
+        with open(STATUS_FILE, "r") as f:
+            scraping_status: dict = json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load scraping status: {e}")
+        scraping_status = {}
+else:
+    scraping_status = {}
+
+def save_scraping_status():
+    """Persist scraping status to disk."""
+    try:
+        with open(STATUS_FILE, "w") as f:
+            json.dump(scraping_status, f)
+    except Exception as e:
+        logger.error(f"Failed to save scraping status: {e}")
 
 def sanitize_filename(text: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_")
@@ -74,6 +94,7 @@ async def scrape_certification(cert_id: str, max_depth: int = MAX_DEPTH) -> List
 
     # Initialize scraping status
     scraping_status[cert_id] = {"status": "in_progress", "pdfs": []}
+    save_scraping_status()
 
     start_url = f"https://learn.microsoft.com/en-us/certifications/{cert_id}"
     # Allow both certification pages and training modules
@@ -141,11 +162,13 @@ async def scrape_certification(cert_id: str, max_depth: int = MAX_DEPTH) -> List
                 await browser.close()
 
         scraping_status[cert_id] = {"status": "completed", "pdfs": [p.name for p in pdf_paths]}
+        save_scraping_status()
         return pdf_paths
 
     except Exception as e:
         logger.error(f"Scraping failed for certification {cert_id}: {e}")
         scraping_status[cert_id] = {"status": "failed", "error": str(e)}
+        save_scraping_status()
         raise
 
 @app.get("/", response_class=HTMLResponse)
@@ -167,6 +190,7 @@ async def initiate_scrape(
         raise HTTPException(status_code=409, detail="Scrape already queued or in progress")
 
     scraping_status[cert_id] = {"status": "queued"}
+    save_scraping_status()
     background_tasks.add_task(scrape_certification, cert_id, max_depth=MAX_DEPTH)
     return RedirectResponse(url="/", status_code=303)
 
