@@ -1,6 +1,5 @@
 FROM python:3.9-slim
 WORKDIR /app
-# Install system dependencies for wkhtmltopdf and Playwright
 RUN apt-get update && apt-get install -y \
      wkhtmltoimage \
      wkhtmltopdf \
@@ -10,7 +9,7 @@ RUN apt-get update && apt-get install -y \
      libcups2 \
      libdrm2 \
      libgbm1 \
-     libasound2 \\
+     libasound2 \
      && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install -r requirements.txt
