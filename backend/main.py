@@ -1,12 +1,12 @@
-from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
 import re
 import asyncio
 import logging
-from typing import List, Set
+from typing import List, Set, Tuple
 from urllib.parse import urlparse, urljoin, urldefrag
 from playwright.async_api import async_playwright
 from collections import deque
@@ -23,6 +23,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Serve static files (relative paths)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
 # Templates directory (relative to project root)
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
@@ -45,9 +46,11 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # In‑memory scraping status
 scraping_status: dict = {}
 
+
 def sanitize_filename(text: str) -> str:
     """Create a filesystem‑safe filename from a URL segment."""
     return re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_")
+
 
 def normalize_url(href: str) -> str:
     """Resolve relative URLs against the Microsoft Learn base URL and strip fragments."""
@@ -56,46 +59,47 @@ def normalize_url(href: str) -> str:
     full, _ = urldefrag(full)
     return full
 
-def generate_hash_filename(url: str, max_length: int = 200) -> str:
-    """Generate a unique filename using a hash and a sanitized path segment.
 
-    The hash ensures uniqueness even when different URLs share the same final
-    path segment. The sanitized segment is kept for readability when possible.
-    """
+def generate_hash_filename(url: str, max_length: int = 200) -> str:
+    """Generate a unique filename using a hash and a sanitized path segment."""
     url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
     parsed = urlparse(url)
     path_segments = parsed.path.strip("/").split("/")
     if path_segments and path_segments[-1]:
         segment = sanitize_filename(path_segments[-1])
-        # Prepend hash to guarantee uniqueness, truncate if necessary
-        combined = f"{url_hash}_{segment}" if segment else url_hash
-        return combined[:max_length]
-    return url_hash
+    else:
+        segment = ""
+    combined = f"{url_hash}_{segment}" if segment else url_hash
+    return combined[:max_length]
 
-async def scrape_certification(cert_id: str) -> List[Path]:
+
+# Maximum recursion depth to avoid runaway crawling
+MAX_DEPTH = 2
+
+
+async def scrape_certification(cert_id: str, max_depth: int = MAX_DEPTH) -> List[Path]:
     """Recursively crawl a certification's Learn pages and save each as a PDF.
-
     The crawler is constrained to URLs that belong to the certification or to
-    Microsoft Learn training modules.
+    Microsoft Learn training modules and respects a shallow maximum depth.
+    PDFs are generated during the initial visit to avoid double network traffic.
     """
     cert_folder = OUTPUT_DIR / cert_id
     cert_folder.mkdir(parents=True, exist_ok=True)
-    
+
     # Initialize scraping status
     scraping_status[cert_id] = {"status": "in_progress", "pdfs": []}
 
     start_url = f"https://learn.microsoft.com/en-us/certifications/{cert_id}"
     # Allow both certification pages and training modules
     allowed_prefixes = [
-        f"/en-us/learn/certifications/{cert_id}",
-        "/en-us/training/modules",
+        f"/en-us/certifications/{cert_id}",
         "/en-us/learn/modules",
     ]
 
     pdf_paths: List[Path] = []
     visited: Set[str] = set()
     queued: Set[str] = set()
-    queue: deque = deque([start_url])
+    queue: deque[Tuple[str, int]] = deque([(start_url, 0)])  # (url, depth)
     queued.add(start_url)
 
     try:
@@ -103,93 +107,103 @@ async def scrape_certification(cert_id: str) -> List[Path]:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context()
             page = await context.new_page()
-            
+
             try:
                 while queue:
-                    url = queue.popleft()
+                    url, depth = queue.popleft()
+                    if depth > max_depth:
+                        continue
                     if url in visited:
                         continue
                     visited.add(url)
+
                     try:
                         await page.goto(url, wait_until="networkidle")
                         await asyncio.sleep(0.5)
-                        anchors = await page.query_selector_all("a[href]")
-                        for a in anchors:
-                            href = await a.get_attribute("href")
-                            if not href:
-                                continue
-                            full = normalize_url(href)
-                            parsed = urlparse(full)
-                            if parsed.netloc != "learn.microsoft.com":
-                                continue
-                            if not any(parsed.path.startswith(pfx) for pfx in allowed_prefixes):
-                                continue
-                            if full not in visited and full not in queued:
-                                queue.append(full)
-                                queued.add(full)
-                        pdf_name = generate_hash_filename(url) + ".pdf"
-                        pdf_path = cert_folder / pdf_name
-                        pdf_page = await browser.new_page()
-                        try:
-                            await pdf_page.goto(url, wait_until="networkidle")
-                            await pdf_page.pdf(path=str(pdf_path), timeout=60000)
-                        finally:
-                            await pdf_page.close()
-                        pdf_paths.append(pdf_path)
-                        logger.info(f"Saved PDF %s", pdf_path)
                     except Exception as e:
-                        logger.error(f"Error processing {url}: {e}")
+                        logger.error(f"Failed to load {url}: {e}")
                         continue
+
+                    # Extract links for further crawling
+                    anchors = await page.query_selector_all("a[href]")
+                    for a in anchors:
+                        href = await a.get_attribute("href")
+                        if not href:
+                            continue
+                        full = normalize_url(href)
+
+                        parsed = urlparse(full)
+                        if parsed.netloc != "learn.microsoft.com":
+                            continue
+                        if not any(parsed.path.startswith(pfx) for pfx in allowed_prefixes):
+                            continue
+                        if full not in visited and full not in queued:
+                            queue.append((full, depth + 1))
+                            queued.add(full)
+
+                    # Generate PDF for the current page
+                    pdf_name = generate_hash_filename(url) + ".pdf"
+                    pdf_path = cert_folder / pdf_name
+                    await page.pdf(path=str(pdf_path), timeout=60000)
+                    pdf_paths.append(pdf_path)
+                    logger.info(f"Saved PDF {pdf_path}")
+
             finally:
                 await browser.close()
-            
-            scraping_status[cert_id] = {"status": "completed", "pdfs": [p.name for p in pdf_paths]}
-            return pdf_paths
+
+        scraping_status[cert_id] = {"status": "completed", "pdfs": [p.name for p in pdf_paths]}
+        return pdf_paths
+
     except Exception as e:
         logger.error(f"Scraping failed for certification {cert_id}: {e}")
         scraping_status[cert_id] = {"status": "failed", "error": str(e)}
         raise
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Render the landing page with certification list and status."""
     return templates.TemplateResponse(
         "index.html",
-        {
-            "request": request,
-            "certifications": CERTIFICATIONS,
-            "scraping_status": scraping_status,
-        },
+        {"request": request, "certifications": CERTIFICATIONS, "scraping_status": scraping_status},
     )
 
+
 @app.post("/{cert_id}/scrape")
-async def initiate_scrape(cert_id: str, background_tasks: BackgroundTasks):
+async def initiate_scrape(
+    cert_id: str,
+    background_tasks: BackgroundTasks,
+):
     if cert_id not in CERTIFICATIONS:
-        return JSONResponse({"error": "Invalid certification ID"}, status_code=400)
+        raise HTTPException(status_code=400, detail="Invalid certification ID")
+
     if scraping_status.get(cert_id, {}).get("status") in {"queued", "in_progress"}:
-        return JSONResponse({"error": "Scrape already queued or in progress"}, status_code=409)
+        raise HTTPException(status_code=409, detail="Scrape already queued or in progress")
+
     scraping_status[cert_id] = {"status": "queued"}
-    background_tasks.add_task(scrape_certification, cert_id)
-    return {"status": "queued", "cert_id": cert_id}
+    background_tasks.add_task(scrape_certification, cert_id, max_depth=MAX_DEPTH)
+    return RedirectResponse(url="/", status_code=303)
+
 
 @app.get("/{cert_id}/status")
 async def get_scrape_status(cert_id: str):
     if cert_id not in CERTIFICATIONS:
-        return JSONResponse({"error": "Invalid certification ID"}, status_code=400)
+        raise HTTPException(status_code=400, detail="Invalid certification ID")
     return scraping_status.get(cert_id, {"status": "not_started"})
+
 
 @app.get("/pdfs/{cert_id}/{filename}", response_class=FileResponse)
 async def download_pdf(cert_id: str, filename: str):
     """Download a PDF generated for a specific certification.
-
-    Path traversal is prevented using Path.is_relative_to (Python 3.9+).
+    Path traversal is prevented by scoping to the certification folder.
     """
     file_path = (OUTPUT_DIR / cert_id / filename).resolve()
-    try:
-        if not file_path.is_relative_to(OUTPUT_DIR.resolve()):
-            raise ValueError("Path traversal detected")
-    except Exception:
-        return JSONResponse({"error": "Invalid file path"}, status_code=400)
+    cert_dir_resolved = (OUTPUT_DIR / cert_id).resolve()
+
+    if not file_path.is_relative_to(cert_dir_resolved):
+        raise HTTPException(status_code=400, detail="Invalid file path")
+
     if not file_path.is_file():
-        return JSONResponse({"error": "File not found"}, status_code=404)
+        raise HTTPException(status_code=404, detail="File not found")
+
     return FileResponse(file_path)
