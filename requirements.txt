@@ -1,0 +1,1 @@
+fastapi==0.104.1\nplaywright==1.39.0\nuvicorn==0.25.0\nrequests==2.32.2
