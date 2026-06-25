@@ -7,7 +7,7 @@ import re
 import asyncio
 import logging
 from typing import List, Set
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, urldefrag
 from playwright.async_api import async_playwright
 from collections import deque
 import hashlib
@@ -18,10 +18,13 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Serve static files (adjusted to match Docker WORKDIR /app)
-app.mount("/static", StaticFiles(directory="/app/static"), name="static")
+# Determine base directory (project root)
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Serve static files (relative paths)
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 # Templates directory (relative to project root)
-templates = Jinja2Templates(directory="/app/templates")
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 # Certification list (example subset)
 CERTIFICATIONS = {
@@ -35,38 +38,45 @@ CERTIFICATIONS = {
     "m365se-102": {"name": "Microsoft 365 Security Operator"},
 }
 
-# Directory where PDFs are stored
-OUTPUT_DIR = Path("/app/pdfs")
+# Directory where PDFs are stored (relative to project root)
+OUTPUT_DIR = BASE_DIR / "pdfs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # In‑memory scraping status
 scraping_status: dict = {}
 
 def sanitize_filename(text: str) -> str:
-    """Create a filesystem‑safe filename from a URL."""
+    """Create a filesystem‑safe filename from a URL segment."""
     return re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_")
 
 def normalize_url(href: str) -> str:
-    """Resolve relative URLs against the Microsoft Learn base URL."""
-    return urljoin("https://learn.microsoft.com", href)
+    """Resolve relative URLs against the Microsoft Learn base URL and strip fragments."""
+    full = urljoin("https://learn.microsoft.com", href)
+    # Remove any URL fragment (the part after #)
+    full, _ = urldefrag(full)
+    return full
 
 def generate_hash_filename(url: str, max_length: int = 200) -> str:
-    """Generate a hash-based filename to avoid filesystem filename length limits."""
+    """Generate a unique filename using a hash and a sanitized path segment.
+
+    The hash ensures uniqueness even when different URLs share the same final
+    path segment. The sanitized segment is kept for readability when possible.
+    """
     url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
-    # Fallback: try to extract the final path segment
     parsed = urlparse(url)
-    path_segments = parsed.path.strip('/').split('/')
+    path_segments = parsed.path.strip("/").split("/")
     if path_segments and path_segments[-1]:
         segment = sanitize_filename(path_segments[-1])
-        if len(segment) <= max_length:
-            return segment
+        # Prepend hash to guarantee uniqueness, truncate if necessary
+        combined = f"{url_hash}_{segment}" if segment else url_hash
+        return combined[:max_length]
     return url_hash
 
 async def scrape_certification(cert_id: str) -> List[Path]:
     """Recursively crawl a certification's Learn pages and save each as a PDF.
 
-    The crawler is constrained to URLs that start with the certification's
-    module path to avoid crawling the entire Microsoft documentation site.
+    The crawler is constrained to URLs that belong to the certification or to
+    Microsoft Learn training modules.
     """
     cert_folder = OUTPUT_DIR / cert_id
     cert_folder.mkdir(parents=True, exist_ok=True)
@@ -75,7 +85,12 @@ async def scrape_certification(cert_id: str) -> List[Path]:
     scraping_status[cert_id] = {"status": "in_progress", "pdfs": []}
 
     start_url = f"https://learn.microsoft.com/en-us/certifications/{cert_id}"
-    allowed_prefix = f"/en-us/learn/certifications/{cert_id}"
+    # Allow both certification pages and training modules
+    allowed_prefixes = [
+        f"/en-us/learn/certifications/{cert_id}",
+        "/en-us/training/modules",
+        "/en-us/learn/modules",
+    ]
 
     pdf_paths: List[Path] = []
     visited: Set[str] = set()
@@ -107,15 +122,13 @@ async def scrape_certification(cert_id: str) -> List[Path]:
                             parsed = urlparse(full)
                             if parsed.netloc != "learn.microsoft.com":
                                 continue
-                            if not parsed.path.startswith(allowed_prefix):
+                            if not any(parsed.path.startswith(pfx) for pfx in allowed_prefixes):
                                 continue
-                            # Add to visited/queued set before appending to avoid duplicates
                             if full not in visited and full not in queued:
                                 queue.append(full)
                                 queued.add(full)
                         pdf_name = generate_hash_filename(url) + ".pdf"
                         pdf_path = cert_folder / pdf_name
-                        # Use try-finally to ensure pdf_page is always closed
                         pdf_page = await browser.new_page()
                         try:
                             await pdf_page.goto(url, wait_until="networkidle")
@@ -130,12 +143,9 @@ async def scrape_certification(cert_id: str) -> List[Path]:
             finally:
                 await browser.close()
             
-            # Mark as completed if we get here without uncaught exceptions
             scraping_status[cert_id] = {"status": "completed", "pdfs": [p.name for p in pdf_paths]}
             return pdf_paths
-            
     except Exception as e:
-        # If any uncaught exception occurs (e.g., browser launch failure), mark as failed
         logger.error(f"Scraping failed for certification {cert_id}: {e}")
         scraping_status[cert_id] = {"status": "failed", "error": str(e)}
         raise
