@@ -10,6 +10,7 @@ from typing import List, Set
 from urllib.parse import urlparse, urljoin
 from playwright.async_api import async_playwright
 from collections import deque
+import hashlib
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -49,6 +50,18 @@ def normalize_url(href: str) -> str:
     """Resolve relative URLs against the Microsoft Learn base URL."""
     return urljoin("https://learn.microsoft.com", href)
 
+def generate_hash_filename(url: str, max_length: int = 200) -> str:
+    """Generate a hash-based filename to avoid filesystem filename length limits."""
+    url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
+    # Fallback: try to extract the final path segment
+    parsed = urlparse(url)
+    path_segments = parsed.path.strip('/').split('/')
+    if path_segments and path_segments[-1]:
+        segment = sanitize_filename(path_segments[-1])
+        if len(segment) <= max_length:
+            return segment
+    return url_hash
+
 async def scrape_certification(cert_id: str) -> List[Path]:
     """Recursively crawl a certification's Learn pages and save each as a PDF.
 
@@ -57,6 +70,8 @@ async def scrape_certification(cert_id: str) -> List[Path]:
     """
     cert_folder = OUTPUT_DIR / cert_id
     cert_folder.mkdir(parents=True, exist_ok=True)
+    
+    # Initialize scraping status
     scraping_status[cert_id] = {"status": "in_progress", "pdfs": []}
 
     start_url = f"https://learn.microsoft.com/en-us/certifications/{cert_id}"
@@ -64,48 +79,66 @@ async def scrape_certification(cert_id: str) -> List[Path]:
 
     pdf_paths: List[Path] = []
     visited: Set[str] = set()
+    queued: Set[str] = set()
     queue: deque = deque([start_url])
+    queued.add(start_url)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-        page = await context.new_page()
-        while queue:
-            url = queue.popleft()
-            if url in visited:
-                continue
-            visited.add(url)
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
+            
             try:
-                await page.goto(url, wait_until="networkidle")
-                await asyncio.sleep(0.5)
-                anchors = await page.query_selector_all("a[href]")
-                for a in anchors:
-                    href = await a.get_attribute("href")
-                    if not href:
+                while queue:
+                    url = queue.popleft()
+                    if url in visited:
                         continue
-                    full = normalize_url(href)
-                    parsed = urlparse(full)
-                    if parsed.netloc != "learn.microsoft.com":
+                    visited.add(url)
+                    try:
+                        await page.goto(url, wait_until="networkidle")
+                        await asyncio.sleep(0.5)
+                        anchors = await page.query_selector_all("a[href]")
+                        for a in anchors:
+                            href = await a.get_attribute("href")
+                            if not href:
+                                continue
+                            full = normalize_url(href)
+                            parsed = urlparse(full)
+                            if parsed.netloc != "learn.microsoft.com":
+                                continue
+                            if not parsed.path.startswith(allowed_prefix):
+                                continue
+                            # Add to visited/queued set before appending to avoid duplicates
+                            if full not in visited and full not in queued:
+                                queue.append(full)
+                                queued.add(full)
+                        pdf_name = generate_hash_filename(url) + ".pdf"
+                        pdf_path = cert_folder / pdf_name
+                        # Use try-finally to ensure pdf_page is always closed
+                        pdf_page = await browser.new_page()
+                        try:
+                            await pdf_page.goto(url, wait_until="networkidle")
+                            await pdf_page.pdf(path=str(pdf_path), timeout=60000)
+                        finally:
+                            await pdf_page.close()
+                        pdf_paths.append(pdf_path)
+                        logger.info(f"Saved PDF %s", pdf_path)
+                    except Exception as e:
+                        logger.error(f"Error processing {url}: {e}")
                         continue
-                    if not parsed.path.startswith(allowed_prefix):
-                        continue
-                    if full not in visited:
-                        queue.append(full)
-                pdf_name = sanitize_filename(url) + ".pdf"
-                pdf_path = cert_folder / pdf_name
-                pdf_page = await browser.new_page()
-                await pdf_page.goto(url, wait_until="networkidle")
-                await pdf_page.pdf(path=str(pdf_path), timeout=60000)
-                await pdf_page.close()
-                pdf_paths.append(pdf_path)
-                logger.info(f"Saved PDF %s", pdf_path)
-            except Exception as e:
-                logger.error(f"Error processing {url}: {e}")
-                continue
-        await browser.close()
-
-    scraping_status[cert_id] = {"status": "completed", "pdfs": [p.name for p in pdf_paths]}
-    return pdf_paths
+            finally:
+                await browser.close()
+            
+            # Mark as completed if we get here without uncaught exceptions
+            scraping_status[cert_id] = {"status": "completed", "pdfs": [p.name for p in pdf_paths]}
+            return pdf_paths
+            
+    except Exception as e:
+        # If any uncaught exception occurs (e.g., browser launch failure), mark as failed
+        logger.error(f"Scraping failed for certification {cert_id}: {e}")
+        scraping_status[cert_id] = {"status": "failed", "error": str(e)}
+        raise
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
