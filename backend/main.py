@@ -9,6 +9,7 @@ import logging
 from typing import List, Set
 from urllib.parse import urlparse, urljoin
 from playwright.async_api import async_playwright
+from collections import deque
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -59,26 +60,24 @@ async def scrape_certification(cert_id: str) -> List[Path]:
     scraping_status[cert_id] = {"status": "in_progress", "pdfs": []}
 
     start_url = f"https://learn.microsoft.com/en-us/certifications/{cert_id}"
-    # The Learn navigation for a cert uses the path /en-us/learn/certifications/<cert_id>/... 
     allowed_prefix = f"/en-us/learn/certifications/{cert_id}"
 
     pdf_paths: List[Path] = []
     visited: Set[str] = set()
-    queue: List[str] = [start_url]
+    queue: deque = deque([start_url])
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
         page = await context.new_page()
         while queue:
-            url = queue.pop(0)
+            url = queue.popleft()
             if url in visited:
                 continue
             visited.add(url)
             try:
                 await page.goto(url, wait_until="networkidle")
                 await asyncio.sleep(0.5)
-                # Extract anchors
                 anchors = await page.query_selector_all("a[href]")
                 for a in anchors:
                     href = await a.get_attribute("href")
@@ -92,7 +91,6 @@ async def scrape_certification(cert_id: str) -> List[Path]:
                         continue
                     if full not in visited:
                         queue.append(full)
-                # Generate PDF for current page
                 pdf_name = sanitize_filename(url) + ".pdf"
                 pdf_path = cert_folder / pdf_name
                 pdf_page = await browser.new_page()
@@ -145,7 +143,6 @@ async def download_pdf(cert_id: str, filename: str):
     """
     file_path = (OUTPUT_DIR / cert_id / filename).resolve()
     try:
-        # Ensure the file is inside the OUTPUT_DIR
         if not file_path.is_relative_to(OUTPUT_DIR.resolve()):
             raise ValueError("Path traversal detected")
     except Exception:
