@@ -1,6 +1,5 @@
-fastapi
-uvicorn
-playwright
-requests
-tools
-python-dotenv
+fastapi>=0.104.0
+uvicorn>=0.17.0
+playwright>=1.40.0
+pydantic>=1.10.0
+aiofiles>=23.1.0
