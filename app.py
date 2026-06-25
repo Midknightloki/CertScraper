@@ -1,1 +1,17 @@
-from fastapi import FastAPI\n\napp = FastAPI()\n\n@app.get("/certs")\ndef get_certs():\n    # TODO: Implement Microsoft cert search\n    return {\n        "message": "CertScraper API. Search endpoint not yet implemented."\n    }\n\n@app.get("/{cert_id}/downloads")\ndef get_cert_downloads(cert_id: str):\n    # TODO: Implement recursive scraping and PDF generation\n    return {\n        "message": f"Downloads for {cert_id}. Scraper functionality not yet implemented."\n    }
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/certs")
+async def get_certs():
+    # TODO: Implement Microsoft cert search
+    return {
+        "message": "CertScraper API. Search endpoint not yet implemented."
+    }
+
+@app.get("/\{cert_id}/downloads")
+async def get_cert_downloads(cert_id: str):
+    # TODO: Implement recursive scraping and PDF generation
+    return {
+        "message": f"Downloads for \{cert_id\}. Scraper functionality not yet implemented."
+    }

@@ -4,7 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
 import re
-from typing import List
+import asyncio
 
 app = FastAPI()
 
@@ -24,57 +24,76 @@ CERTIFICATIONS = {
     "m365se-102": {"name": "Microsoft 365 Security Operator"},
 }
 
-# Output directory for PDFs (mounted volume)
-OUTPUT_DIR = Path("/app/pdfs")
+# Output directory for PDFs (relative to working directory)
+OUTPUT_DIR = Path("./pdfs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 def sanitize_filename(text: str) -> str:
     # Replace any non-alphanumeric character with underscore
-    return re.sub(r'\W+', '_', text)
+    return re.sub(r'[^a-zA-Z0-9]+', '_', text).strip('_')
 
-def scrape_certification(cert_id: str) -> List[str]:
+async def scrape_certification(cert_id: str) -> list[Path]:
     """Scrape Microsoft Learn pages for a certification and generate PDFs."""
-    from playwright.sync_api import sync_playwright
-
     pdf_paths = []
-    # URLs to explore
+    cert_folder = OUTPUT_DIR / cert_id
+    cert_folder.mkdir(parents=True, exist_ok=True)
+
+    # Start with the certification page
     start_url = f"https://learn.microsoft.com/en-us/certifications/{cert_id}"
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(start_url)
-
-        # Collect all links that look like study material
-        links = page.query_selector_all("a[href]")
-        study_urls = set()
-        for link in links:
-            href = link.get_attribute("href")
-            if href and "learn.microsoft.com" in href and (
-                "training" in href or "documentation" in href or "learning-path" in href
-            ):
-                full_url = "https://learn.microsoft.com" + href if href.startswith("/") else href
-                study_urls.add(full_url)
-
-        # Generate PDF for each study URL
-        for url in study_urls:
-            page.goto(url, wait_until="networkidle")
-            filename = sanitize_filename(url) + ".pdf"
-            pdf_path = OUTPUT_DIR / filename
-            page.pdf(path=pdf_path, timeout=60000)
-            pdf_paths.append(pdf_path.name)
-
-        browser.close()
+    
+    async def _scrape_page(url: str):
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(url, wait_until="networkidle")
+            
+            # Extract links that look like study material
+            links = page.query_selector_all("a[href]")
+            study_urls = set()
+            for link in links:
+                href = link.get_attribute("href")
+                if href and "learn.microsoft.com" in href:
+                    # Normalize URL
+                    if href.startswith("/"):
+                        full_url = "https://learn.microsoft.com" + href
+                    else:
+                        full_url = href
+                    if any(keyword in href.lower() for keyword in ["training", "documentation", "learning-path"]):
+                        study_urls.add(full_url)
+            
+            # Generate PDF for each study URL
+            for url in study_urls:
+                # Derive a filename based on URL path
+                filename = sanitize_filename(url) + ".pdf"
+                pdf_path = cert_folder / filename
+                # Use Playwright to PDF the page
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    page = await browser.new_page()
+                    await page.goto(url, wait_until="networkidle")
+                    await page.pdf(path=pdf_path, timeout=60000)
+                    await browser.close()
+                pdf_paths.append(pdf_path)
+    
+    # Schedule all page scrapes concurrently
+    await _scrape_page(start_url)
+    
+    # Optionally, recursively follow pagination or additional links
+    # For now, just process the direct links found on the certification page
+    
+    await browser.close()
     return pdf_paths
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     # List all PDF files generated so far
-    pdf_files = [
-        f.name for f in OUTPUT_DIR.iterdir()
-        if f.is_file() and f.suffix.lower() == ".pdf"
-    ]
-    # Remove tracking file if present
-    pdf_files = [name for name in pdf_files if name != "last_scrape.txt"]
+    pdf_files = []
+    for cert_id in CERTIFICATIONS:
+        cert_folder = OUTPUT_DIR / cert_id
+        if cert_folder.exists():
+            pdf_files.extend([p for p in cert_folder.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"])
+    
     return templates.TemplateResponse(
         "index.html",
         {
@@ -84,21 +103,25 @@ async def index(request: Request):
         },
     )
 
-@app.get("/scrape")
-async def scrape_endpoint(cert_id: str):
+@app.get("/{cert_id}/downloads")
+async def get_cert_downloads(cert_id: str):
     if cert_id not in CERTIFICATIONS:
         return {"error": "Invalid certification ID"}
-    # Run scraping (blocking) – acceptable for demo purposes
-    generated_pdfs = scrape_certification(cert_id)
+    
+    # Run scraping (non-blocking)
+    pdf_paths = await scrape_certification(cert_id)
     return {
         "status": "Scraping completed",
         "cert_id": cert_id,
-        "generated_pdfs": generated_pdfs,
+        "generated_pdfs": [p.name for p in pdf_paths],
     }
 
 @app.get("/pdfs/{filename}", response_class=FileResponse)
 async def download_pdf(filename: str):
-    pdf_path = OUTPUT_DIR / filename
-    if not pdf_path.exists():
-        return {"error": "File not found"}
-    return FileResponse(pdf_path)
+    # Search in certification subfolders
+    for cert_id in CERTIFICATIONS:
+        cert_folder = OUTPUT_DIR / cert_id
+        pdf_path = cert_folder / filename
+        if pdf_path.exists():
+            return FileResponse(pdf_path)
+    return {"error": "File not found"}
