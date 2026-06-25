@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import requests
 from bs4 import BeautifulSoup
 import os
+import subprocess  # Added missing import
 
 app = Flask(__name__)
 
@@ -46,7 +47,7 @@ def search_certifications():
             module_soup = BeautifulSoup(module_response.text, "html.parser")
             for module_link in module_soup.find_all("a", href=True):
                 if module_link.get("href").startswith("/learn/"):
-                    module_url = f"{BASE_DOMAIN}{module_link.get("href")}"
+                    module_url = f"{BASE_DOMAIN}{module_link.get('href')}"  # Fixed quotes
                     module_data = {
                         "url": module_url,
                         "num_pages": total_pages

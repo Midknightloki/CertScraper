@@ -1,1 +1,7 @@
-fastapi==0.104.1\nplaywright==1.39.0\nuvicorn==0.25.0\nrequests==2.32.2
+fastapi==0.104.1
+playwright==1.39.0
+uvicorn==0.25.0
+requests==2.32.2
+flask==2.3.2
+beautifulsoup4==4.12.2
+gunicorn==21.2.0
