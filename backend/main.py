@@ -97,6 +97,7 @@ async def scrape_certification(cert_id: str, max_depth: int = MAX_DEPTH) -> List
     save_scraping_status()
 
     start_url = f"https://learn.microsoft.com/en-us/certifications/{cert_id}"
+
     # Allow both certification pages and training modules
     allowed_prefixes = [
         f"/en-us/certifications/{cert_id}",
@@ -107,6 +108,7 @@ async def scrape_certification(cert_id: str, max_depth: int = MAX_DEPTH) -> List
     visited: Set[str] = set()
     queued: Set[str] = set()
     queue: deque[Tuple[str, int]] = deque([(start_url, 0)])  # (url, depth)
+
     queued.add(start_url)
 
     try:
@@ -138,7 +140,6 @@ async def scrape_certification(cert_id: str, max_depth: int = MAX_DEPTH) -> List
                         if not href:
                             continue
                         full = normalize_url(href)
-
                         parsed = urlparse(full)
                         if parsed.netloc != "learn.microsoft.com":
                             continue
@@ -148,70 +149,28 @@ async def scrape_certification(cert_id: str, max_depth: int = MAX_DEPTH) -> List
                             queue.append((full, depth + 1))
                             queued.add(full)
 
-                    # Generate PDF for the current page
-                    try:
-                        pdf_name = generate_hash_filename(url) + ".pdf"
-                        pdf_path = cert_folder / pdf_name
-                        await page.pdf(path=str(pdf_path), timeout=60000)
-                        pdf_paths.append(pdf_path)
-                        logger.info(f"Saved PDF {pdf_path}")
-                    except Exception as e:
-                        logger.error(f"Failed to generate PDF for {url}: {e}")
+                # Generate PDF for the current page
+                try:
+                    pdf_name = generate_hash_filename(url)
+                    pdf_path = cert_folder / pdf_name + ".pdf"
+                    await page.pdf(path=str(pdf_path), timeout=60000)
+                    pdf_paths.append(pdf_path)
+                    logger.info(f"Saved PDF {pdf_path}")
+                except Exception as e:
+                    logger.error(f"Failed to generate PDF for {url}: {e}")
 
             finally:
                 await browser.close()
 
         scraping_status[cert_id] = {"status": "completed", "pdfs": [p.name for p in pdf_paths]}
-        save_scraping_status()
-        return pdf_paths
-
     except Exception as e:
         logger.error(f"Scraping failed for certification {cert_id}: {e}")
         scraping_status[cert_id] = {"status": "failed", "error": str(e)}
-        save_scraping_status()
-        raise
+
+    save_scraping_status()
+    return pdf_paths
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse(
-        "index.html",
-        {"request": request, "certifications": CERTIFICATIONS, "scraping_status": scraping_status},
-    )
-
-@app.post("/{cert_id}/scrape")
-async def initiate_scrape(
-    cert_id: str,
-    background_tasks: BackgroundTasks,
-):
-    if cert_id not in CERTIFICATIONS:
-        raise HTTPException(status_code=400, detail="Invalid certification ID")
-
-    if scraping_status.get(cert_id, {}).get("status") in {"queued", "in_progress"}:
-        raise HTTPException(status_code=409, detail="Scrape already queued or in progress")
-
-    scraping_status[cert_id] = {"status": "queued"}
-    save_scraping_status()
-    background_tasks.add_task(scrape_certification, cert_id, max_depth=MAX_DEPTH)
-    return RedirectResponse(url="/", status_code=303)
-
-@app.get("/{cert_id}/status")
-async def get_scrape_status(cert_id: str):
-    if cert_id not in CERTIFICATIONS:
-        raise HTTPException(status_code=400, detail="Invalid certification ID")
-    return scraping_status.get(cert_id, {"status": "not_started"})
-
-@app.get("/pdfs/{cert_id}/{filename}", response_class=FileResponse)
-async def download_pdf(cert_id: str, filename: str):
-    if cert_id not in CERTIFICATIONS:
-        raise HTTPException(status_code=400, detail="Invalid certification ID")
-
-    file_path = (OUTPUT_DIR / cert_id / filename).resolve()
-    cert_dir_resolved = (OUTPUT_DIR / cert_id).resolve()
-
-    if not file_path.is_relative_to(cert_dir_resolved):
-        raise HTTPException(status_code=400, detail="Invalid file path")
-
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-
-    return FileResponse(file_path)
+        "index.html", {"request": request, interval: 0.0
