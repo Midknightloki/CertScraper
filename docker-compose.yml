@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./pdfs:/app/pdfs
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --token ${CLOUDFLARE_API_TOKEN} --name certscraper
+    environment:
+      - CLOUDFLARE_API_TOKEN
+    restart: unless-stopped

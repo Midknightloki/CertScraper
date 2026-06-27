@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CertScraper</title>
+    <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<h1>Microsoft Certification Scraper</h1>
+<ul>
+{% for cid, data in certifications.items() %}
+    <li>
+        <strong>{{ data.name }}</strong> ({{ cid }})
+        {% set status = scraping_status.get(cid, {}).get('status', 'not_started') %}
+        - Status: {{ status }}
+        {% if status == 'not_started' %}
+            <form action="/{{ cid }}/scrape" method="post" style="display:inline;">
+                <button type="submit">Scrape</button>
+            </form>
+        {% elif status == 'completed' %}
+            <ul>
+            {% for pdf in scraping_status[cid]['pdfs'] %}
+                <li><a href="/pdfs/{{ cid }}/{{ pdf }}">{{ pdf }}</a></li>
+            {% endfor %}
+            </ul>
+        {% else %}
+            <!-- Hide form during queued/in_progress -->
+        {% endif %}
+    </li>
+{% endfor %}
+</ul>
+</body>
+</html>
